@@ -252,7 +252,7 @@ class ImageSummarizer:
     INITIAL_BACKOFF = 5.0    # Initial wait (seconds) before first retry
     DELAY_BETWEEN = 1.5      # Delay (seconds) between consecutive API calls (40 RPM = 1.5s/req)
 
-    def __init__(self, model_name: str = "qwen/qwen3.5-122b-a10b"):
+    def __init__(self, model_name: str = "nvidia/llama-3.1-nemotron-nano-vl-8b-v1"):
         """
         Args:
             model_name: NVIDIA NIM model ID for a vision-language model.
@@ -639,7 +639,7 @@ class VectorStoreManager:
 def run_pipeline(
     pdf_path: str,
     output_dir: str = "./mock_s3_storage",
-    vlm_model_name: str = "qwen/qwen3.5-122b-a10b",
+    vlm_model_name: str = "nvidia/llama-3.1-nemotron-nano-vl-8b-v1",
     embedding_model=None,
     connection_string: str = DEFAULT_PG_CONNECTION,
     collection_name: str = "multimodal_rag",

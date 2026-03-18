@@ -11,19 +11,19 @@ A modular Python pipeline that extracts text, images, charts, and tables from PD
 │  PDF Input ├───►│  PDFExtractor   ├───►│  ImageSummarizer      ├───►│  Reassembler ├───►│ SmartChunker │
 │            │    │  (PyMuPDF)      │    │  (NVIDIA NIM)         │    │              │    │  (800/100)   │
 └────────────┘    │ • Text per page │    │                       │    │ Injects      │    │              │
-                  │ • Embedded imgs │    │ qwen3.5-122b-a10b     │    │ [IMAGE_REF]  │    │ Never splits │
-                  │ • Rendered pages│    │ (VLM — 122B MoE)      │    │ tags         │    │ image tags   │
+                  │ • Embedded imgs │    │ nemotron-nano-vl-8b   │    │ [IMAGE_REF]  │    │ Never splits │
+                  │ • Rendered pages│    │ (VLM — 8B)            │    │ tags         │    │ image tags   │
                   │   (charts/tables│    │ + Summary caching     │    │              │    │              │
                   └─────────────────┘    └───────────────────────┘    └──────────────┘    └──────┬───────┘
                                                                                                 │
                                                                                                 ▼
 ┌────────────────────┐    ┌────────────────────┐    ┌──────────────────────────────────────────────────────┐
-│  Answer Synthesis  │◄───│  Cross-Encoder     │◄───│  VectorStore (PGVector — Persistent PostgreSQL)     │
-│  (NVIDIA NIM)      │    │  Reranker          │    │                                                      │
-│                    │    │  ms-marco-MiniLM   │    │  Embeddings: llama-nemotron-embed-1b-v2 (NVIDIA NIM) │
-│ qwen3.5-122b-a10b │    │  (local)           │    │  Asymmetric: passage/query input types               │
+│  Answer Synthesis  │◄───│  Cross-Encoder     │◄───│  HYBRID SEARCH                                      │
+│  (NVIDIA NIM)      │    │  Reranker          │    │  ┌─ Semantic (PGVector cosine similarity)            │
+│  nemotron-nano-vl  │    │  ms-marco-MiniLM   │    │  └─ Keyword  (BM25) → Reciprocal Rank Fusion        │
+│  8b-v1             │    │  (local)           │    │  Embeddings: llama-nemotron-embed-1b-v2 (NVIDIA NIM) │
 └────────────────────┘    └────────────────────┘    └──────────────────────────────────────────────────────┘
-       query.py                query.py                              pipeline.py
+       query.py                query.py                              query.py + pipeline.py
 ```
 
 ---
@@ -32,10 +32,11 @@ A modular Python pipeline that extracts text, images, charts, and tables from PD
 
 | Component | Model | Provider | Details |
 |-----------|-------|----------|---------|
-| **VLM (Image Summarization)** | `qwen/qwen3.5-122b-a10b` | NVIDIA NIM | 122B MoE (10B active), vision-language model, 40 RPM free tier |
+| **VLM (Image Summarization)** | `nvidia/llama-3.1-nemotron-nano-vl-8b-v1` | NVIDIA NIM | 8B params, document-focused VLM, fast inference |
 | **Embeddings** | `nvidia/llama-nemotron-embed-1b-v2` | NVIDIA NIM | 1B param, asymmetric model (passage/query), retrieval-optimized |
-| **Answer Synthesis** | `qwen/qwen3.5-122b-a10b` | NVIDIA NIM | Same VLM for generating coherent answers from retrieved chunks |
+| **Answer Synthesis** | `nvidia/llama-3.1-nemotron-nano-vl-8b-v1` | NVIDIA NIM | Same VLM for generating coherent answers from retrieved chunks |
 | **Cross-Encoder Reranker** | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Local (HuggingFace) | Runs locally, reranks top-20 → top-5 for better relevance |
+| **Keyword Search** | BM25 (rank-bm25) | Local | BM25Okapi for keyword matching, merged with semantic via RRF |
 
 > **Note**: All API calls use NVIDIA NIM's free tier via OpenAI-compatible endpoints. Each model requires its own API key from [build.nvidia.com](https://build.nvidia.com).
 
@@ -85,7 +86,7 @@ Create a `.env` file (use `.env.example` as template):
 
 ```env
 # Get keys from each model's page on https://build.nvidia.com
-NVIDIA_VLM_API_KEY=nvapi-xxxxx      # From qwen3.5-122b-a10b model page
+NVIDIA_VLM_API_KEY=nvapi-xxxxx      # From llama-3.1-nemotron-nano-vl-8b-v1 model page
 NVIDIA_EMBED_API_KEY=nvapi-xxxxx    # From llama-nemotron-embed-1b-v2 model page
 
 # PostgreSQL connection
@@ -114,7 +115,7 @@ python query.py
 ```
 Ingestion_prototype/
 ├── pipeline.py              # Core ingestion pipeline (6 classes + orchestrator)
-├── query.py                 # Interactive query tool (reranker + LLM synthesis)
+├── query.py                 # Interactive query tool (hybrid search + reranker + LLM synthesis)
 ├── main.py                  # Entry point — runs pipeline and prints results
 ├── requirements.txt         # Python dependencies
 ├── .env                     # Your API keys (not committed)
@@ -153,7 +154,7 @@ result = extractor.extract("sample.pdf")
 
 ### Step 2: `ImageSummarizer`
 
-Sends each image to the **NVIDIA NIM VLM** (`qwen/qwen3.5-122b-a10b`) for structured summarization.
+Sends each image to the **NVIDIA NIM VLM** (`nvidia/llama-3.1-nemotron-nano-vl-8b-v1`) for structured summarization.
 
 **Key features:**
 - **Image resizing**: Images > 1024px are downscaled before sending (reduces payload from ~15MB to ~200KB)
@@ -172,7 +173,7 @@ Sends each image to the **NVIDIA NIM VLM** (`qwen/qwen3.5-122b-a10b`) for struct
 | 4. Semantic Keywords | 5-10 keywords for vector similarity matching |
 
 ```python
-summarizer = ImageSummarizer(model_name="qwen/qwen3.5-122b-a10b")
+summarizer = ImageSummarizer(model_name="nvidia/llama-3.1-nemotron-nano-vl-8b-v1")
 summarizer.summarize_all(extraction.images, cache_path="./mock_s3_storage/summaries_cache.json")
 ```
 
@@ -247,25 +248,35 @@ vectorstore = store.connect()              # Connect to existing (query)
 
 ## 🔍 Query Module (query.py)
 
-Interactive query tool with a **3-stage retrieval pipeline**:
+Interactive query tool with a **4-stage hybrid retrieval pipeline**:
 
-### Stage 1: Vector Search
-- Retrieves **top 20 candidates** from PGVector via cosine similarity
-- Uses `nvidia/llama-nemotron-embed-1b-v2` with `input_type="query"` for the search embedding
+### Stage 1: Hybrid Search (Semantic + Keyword)
+
+Combines two retrieval strategies and merges results using **Reciprocal Rank Fusion (RRF)**:
+
+| Strategy | Method | What It Catches |
+|----------|--------|-----------------|
+| **Semantic** | PGVector cosine similarity | Meaning-based matches ("provisioning timelines" → "SLA is 4 hours") |
+| **Keyword** | BM25 (rank-bm25) | Exact term matches ("ERR-4102" → exact error code) |
+| **Fusion** | RRF (alpha=0.5) | Merges both ranked lists by position, returns top 20 |
+
+- BM25 index is built at startup from all chunks (loaded via direct SQL query)
+- Alpha parameter controls balance: 0.5 = equal weight, 0.7 = favor semantic, 0.3 = favor keyword
 
 ### Stage 2: Cross-Encoder Reranking
 - **Model**: `cross-encoder/ms-marco-MiniLM-L-6-v2` (runs locally)
 - Processes each (query, chunk) pair jointly for fine-grained relevance scoring
-- Reranks 20 candidates → **top 5** most relevant
+- Reranks 20 hybrid candidates → **top 5** most relevant
 
 ### Stage 3: LLM Answer Synthesis
-- **Model**: `qwen/qwen3.5-122b-a10b` (via NVIDIA NIM)
+- **Model**: `nvidia/llama-3.1-nemotron-nano-vl-8b-v1` (via NVIDIA NIM)
 - Takes the top 5 chunks as context + user question
 - Generates a coherent, cited answer (only from provided context)
 - Displays formatted answer + supporting sources with type indicators (📄 text / 🖼️ image)
 
 ```bash
 python query.py
+# Search mode: HYBRID (Semantic + Keyword)
 # 📝 Your question: What are the main features of TechMobile?
 ```
 
@@ -280,7 +291,7 @@ Pass any NVIDIA NIM vision model:
 ```python
 vectorstore, chunks = run_pipeline(
     pdf_path="report.pdf",
-    vlm_model_name="qwen/qwen3.5-397b-a17b",  # Larger, slower, more capable
+    vlm_model_name="qwen/qwen3.5-122b-a10b",  # Larger, slower, more capable
 )
 ```
 
@@ -324,7 +335,7 @@ pip install truststore
 ### NVIDIA NIM 401 Unauthorized
 
 - Ensure your API key is from the **correct model page** (each model has its own key)
-- `NVIDIA_VLM_API_KEY` → from the `qwen3.5-122b-a10b` page
+- `NVIDIA_VLM_API_KEY` → from the `llama-3.1-nemotron-nano-vl-8b-v1` page
 - `NVIDIA_EMBED_API_KEY` → from the `llama-nemotron-embed-1b-v2` page
 
 ### NVIDIA NIM 429 Rate Limit
@@ -371,6 +382,7 @@ Press **F5** to refresh data after a new ingestion run.
 | `langchain-postgres` | PGVector integration for persistent vector storage |
 | `psycopg[binary]` | PostgreSQL driver for Python |
 | `sentence-transformers` | Cross-encoder reranker (local, query.py) |
+| `rank-bm25` | BM25Okapi keyword search for hybrid retrieval |
 | `Pillow` | Image resizing and format conversion |
 | `python-dotenv` | Environment variable loading from .env |
 | `truststore` | OS-level SSL certificate handling |
@@ -381,10 +393,11 @@ Press **F5** to refresh data after a new ingestion run.
 
 | Metric | Value |
 |--------|-------|
-| **Image summarization speed** | ~5-10 seconds per image (qwen3.5-122b-a10b) |
-| **319 images total time** | ~30-45 minutes (first run), instant (cached re-run) |
+| **Image summarization speed** | ~2-4 seconds per image (nemotron-nano-vl-8b) |
+| **319 images total time** | ~15-25 minutes (first run), instant (cached re-run) |
 | **Embedding speed** | ~1-2 minutes for 550 chunks |
-| **Query response time** | ~5-10 seconds (search + rerank + LLM synthesis) |
+| **Query response time** | ~5-8 seconds (hybrid search + rerank + LLM synthesis) |
+| **Search mode** | Hybrid (Semantic + BM25 keyword, merged with RRF) |
 | **Embedding dimensions** | Model-dependent (llama-nemotron-embed-1b-v2) |
 | **NVIDIA NIM rate limit** | 40 RPM per API key |
 | **NVIDIA NIM free credits** | ~1000 per API key |
