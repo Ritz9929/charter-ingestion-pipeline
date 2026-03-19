@@ -7,23 +7,27 @@ A modular Python pipeline that extracts text, images, charts, and tables from PD
 ## 🏗️ Architecture
 
 ```
-┌────────────┐    ┌─────────────────┐    ┌───────────────────────┐    ┌──────────────┐    ┌──────────────┐
-│  PDF Input ├───►│  PDFExtractor   ├───►│  ImageSummarizer      ├───►│  Reassembler ├───►│ SmartChunker │
-│            │    │  (PyMuPDF)      │    │  (NVIDIA NIM)         │    │              │    │  (800/100)   │
-└────────────┘    │ • Text per page │    │                       │    │ Injects      │    │              │
-                  │ • Embedded imgs │    │ nemotron-nano-vl-8b   │    │ [IMAGE_REF]  │    │ Never splits │
-                  │ • Rendered pages│    │ (VLM — 8B)            │    │ tags         │    │ image tags   │
-                  │   (charts/tables│    │ + Summary caching     │    │              │    │              │
-                  └─────────────────┘    └───────────────────────┘    └──────────────┘    └──────┬───────┘
-                                                                                                │
-                                                                                                ▼
-┌────────────────────┐    ┌────────────────────┐    ┌──────────────────────────────────────────────────────┐
-│  Answer Synthesis  │◄───│  Cross-Encoder     │◄───│  HYBRID SEARCH                                      │
-│  (NVIDIA NIM)      │    │  Reranker          │    │  ┌─ Semantic (PGVector cosine similarity)            │
-│  nemotron-nano-vl  │    │  ms-marco-MiniLM   │    │  └─ Keyword  (BM25) → Reciprocal Rank Fusion        │
-│  8b-v1             │    │  (local)           │    │  Embeddings: llama-nemotron-embed-1b-v2 (NVIDIA NIM) │
-└────────────────────┘    └────────────────────┘    └──────────────────────────────────────────────────────┘
-       query.py                query.py                              query.py + pipeline.py
+┌────────────┐    ┌──────────────────┐    ┌──────────────────────────────────┐    ┌──────────────┐    ┌──────────────┐
+│  PDF Input ├───►│  PDFExtractor    ├───►│  ImageSummarizer                 ├───►│  Reassembler ├───►│ SmartChunker │
+│            │    │  (PyMuPDF)       │    │  (NVIDIA NIM)                    │    │              │    │  (800/100)   │
+└────────────┘    │ • Text per page  │    │                                  │    │ Injects      │    │              │
+                  │ • Embedded imgs  │    │ llama-3.1-nemotron-nano-vl-8b-v1 │    │ [IMAGE_REF]  │    │ Never splits │
+                  │ • Rendered pages │    │ (VLM — 8B params)                │    │ tags         │    │ image tags   │
+                  │   (charts/tables)│    │ Disk: ~16 GB | VRAM: ~16 GB FP16 │    │              │    │              │
+                  │                  │    │ + Summary caching                │    │              │    │              │
+                  └──────────────────┘    └──────────────────────────────────┘    └──────────────┘    └──────┬───────┘
+                                                                                                           │
+                                                                                                           ▼
+┌──────────────────────────────┐  ┌──────────────────────────┐  ┌──────────────────────────────────────────────────────┐
+│  Answer Synthesis            │◄─│  Cross-Encoder Reranker  │◄─│  HYBRID SEARCH                                      │
+│  (NVIDIA NIM)                │  │                          │  │                                                      │
+│                              │  │  ms-marco-MiniLM-L-6-v2  │  │  ┌─ Semantic (PGVector cosine similarity)            │
+│ llama-3.1-nemotron-nano      │  │  (22M params, local CPU) │  │  └─ Keyword  (BM25) → Reciprocal Rank Fusion        │
+│ -vl-8b-v1                    │  │  Disk: ~90 MB            │  │                                                      │
+│ (8B params)                  │  │  RAM:  ~90 MB            │  │  Embeddings: llama-nemotron-embed-1b-v2 (NVIDIA NIM) │
+│ Disk: ~16 GB | VRAM: ~16 GB │  │                          │  │  (1B params) Disk: ~2 GB | VRAM: ~2 GB FP16         │
+└──────────────────────────────┘  └──────────────────────────┘  └──────────────────────────────────────────────────────┘
+         query.py                          query.py                              query.py + pipeline.py
 ```
 
 ---
