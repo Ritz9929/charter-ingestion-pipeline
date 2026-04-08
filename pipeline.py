@@ -13,6 +13,7 @@ A modular pipeline that:
 
 import os
 import re
+import hashlib
 import json
 import base64
 import time
@@ -88,8 +89,8 @@ class PDFExtractor:
     MIN_DRAWINGS_THRESHOLD = 10
 
     def __init__(self, output_dir: str = "./mock_s3_storage", render_dpi: int = 200):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.base_output_dir = Path(output_dir)
+        self.base_output_dir.mkdir(parents=True, exist_ok=True)
         self.render_dpi = render_dpi
 
     def _has_vector_graphics(self, page) -> bool:
@@ -107,7 +108,7 @@ class PDFExtractor:
         pix = page.get_pixmap(matrix=mat)
 
         filename = f"page{page_num}_rendered.png"
-        filepath = self.output_dir / filename
+        filepath = self.doc_output_dir / filename
         pix.save(str(filepath))
 
         return ExtractedImage(
@@ -118,12 +119,19 @@ class PDFExtractor:
             source_type="rendered",
         )
 
-    def extract(self, pdf_path: str) -> ExtractionResult:
+    def extract(self, pdf_path: str, source_doc: str = "") -> ExtractionResult:
         """Parse the PDF and return text + image metadata."""
         doc = fitz.open(pdf_path)
         result = ExtractionResult()
 
+        # Create a document-specific subfolder for images
+        # e.g., mock_s3_storage/doc4/ instead of mock_s3_storage/
+        doc_folder = source_doc.replace(".", "_") if source_doc else Path(pdf_path).stem
+        self.doc_output_dir = self.base_output_dir / doc_folder
+        self.doc_output_dir.mkdir(parents=True, exist_ok=True)
+
         logger.info(f"Opened PDF: {pdf_path} ({len(doc)} pages)")
+        logger.info(f"  Images will be saved to: {self.doc_output_dir}")
 
         for page_num in range(len(doc)):
             page = doc[page_num]
@@ -158,7 +166,7 @@ class PDFExtractor:
 
                     image_ext = base_image.get("ext", "png")
                     filename = f"page{page_num}_img{saved_img_count}.{image_ext}"
-                    filepath = self.output_dir / filename
+                    filepath = self.doc_output_dir / filename
 
                     # Save image to disk (simulating S3 upload)
                     with open(filepath, "wb") as f:
@@ -348,12 +356,16 @@ class ImageSummarizer:
     def summarize_all(
         self,
         images: list[ExtractedImage],
+        source_doc: str = "unknown",
         cache_path: str = "./mock_s3_storage/summaries_cache.json",
     ) -> list[ExtractedImage]:
         """
         Summarize every image, with disk caching.
         Already-summarized images are loaded from cache instantly.
         New summaries are saved to cache after each image.
+
+        Cache keys include the source document name to prevent
+        collisions between same-numbered pages from different PDFs.
         """
         # Load existing cache
         cache = {}
@@ -368,9 +380,12 @@ class ImageSummarizer:
         total = len(images)
         cached_count = 0
         for idx, img in enumerate(images):
+            # Cache key = "doc4.pdf::page4_rendered.png" (unique per document)
+            cache_key = f"{source_doc}::{img.filename}"
+
             # Check cache first
-            if img.filename in cache:
-                img.summary = cache[img.filename]
+            if cache_key in cache:
+                img.summary = cache[cache_key]
                 cached_count += 1
                 logger.info(f"  [{idx + 1}/{total}] {img.filename} — cached ✓")
                 continue
@@ -379,7 +394,7 @@ class ImageSummarizer:
             img.summary = self.summarize(img)
 
             # Save to cache immediately (so progress is never lost)
-            cache[img.filename] = img.summary
+            cache[cache_key] = img.summary
             cache_file.write_text(json.dumps(cache, indent=2), encoding="utf-8")
 
             # Rate-limit delay
@@ -597,17 +612,48 @@ class VectorStoreManager:
         self.collection_name = collection_name
         self.connection_string = connection_string
 
-    def ingest(self, chunks: list[str]) -> PGVector:
-        """Insert chunks into the PGVector collection (persistent)."""
+    def delete_document(self, source_doc: str):
+        """Delete all chunks belonging to a specific document (for re-ingestion)."""
+        from sqlalchemy import create_engine, text
+        engine = create_engine(self.connection_string)
+        with engine.connect() as conn:
+            result = conn.execute(
+                text("DELETE FROM langchain_pg_embedding WHERE cmetadata->>'source_doc' = :doc"),
+                {"doc": source_doc},
+            )
+            conn.commit()
+            deleted = result.rowcount
+        engine.dispose()
+        if deleted > 0:
+            logger.info(f"Deleted {deleted} old chunks for '{source_doc}'")
+        return deleted
+
+    def ingest(self, chunks: list[str], source_doc: str = "unknown",
+               doc_hash: str = "", page_count: int = 0) -> PGVector:
+        """
+        Insert chunks into the PGVector collection (incremental — keeps existing data).
+
+        Args:
+            chunks:     List of text chunks to embed and store.
+            source_doc: Filename of the source PDF (for tracking & targeted deletion).
+            doc_hash:   SHA-256 hash of the source file (for change detection).
+            page_count: Number of pages in the source PDF.
+        """
         logger.info(f"Connecting to PGVector (collection: {self.collection_name})")
 
-        # Create metadata for each chunk
+        # Delete old chunks for this document (if re-ingesting an updated PDF)
+        self.delete_document(source_doc)
+
+        # Create metadata for each chunk — now tracks source document
         metadatas = []
         for i, chunk in enumerate(chunks):
             metadatas.append({
                 "chunk_index": i,
                 "has_image_ref": "[IMAGE_REFERENCE" in chunk,
                 "char_count": len(chunk),
+                "source_doc": source_doc,
+                "doc_hash": doc_hash,
+                "page_count": page_count,
             })
 
         vectorstore = PGVector.from_texts(
@@ -616,10 +662,10 @@ class VectorStoreManager:
             metadatas=metadatas,
             collection_name=self.collection_name,
             connection=self.connection_string,
-            pre_delete_collection=True,  # Fresh ingest each run
+            pre_delete_collection=False,  # INCREMENTAL: keep existing data
         )
 
-        logger.info(f"Ingested {len(chunks)} chunks into PGVector")
+        logger.info(f"Ingested {len(chunks)} chunks for '{source_doc}' into PGVector")
         return vectorstore
 
     def connect(self) -> PGVector:
@@ -649,6 +695,9 @@ def run_pipeline(
     """
     End-to-end pipeline: Extract → Summarize → Reassemble → Chunk → Store.
 
+    Supports incremental ingestion — each PDF's chunks are tracked by source
+    document name. Re-ingesting a PDF automatically replaces its old chunks.
+
     Args:
         pdf_path:          Path to the input PDF.
         output_dir:        Directory for extracted images.
@@ -662,20 +711,28 @@ def run_pipeline(
     Returns:
         (vectorstore, chunks) — the PGVector store and the raw chunk list.
     """
+    # ── Compute source document identity ──────────────────────────────────
+    source_doc = Path(pdf_path).name
+    with open(pdf_path, "rb") as f:
+        doc_hash = hashlib.sha256(f.read()).hexdigest()
+
     logger.info("=" * 60)
-    logger.info("MULTIMODAL RAG INGESTION PIPELINE — START")
+    logger.info(f"MULTIMODAL RAG INGESTION PIPELINE — START")
+    logger.info(f"  Source: {source_doc}")
+    logger.info(f"  Hash:   {doc_hash[:16]}...")
     logger.info("=" * 60)
 
     # ── Step 1: Extract ───────────────────────────────────────────────────
     logger.info("\n📄 STEP 1: Extracting text and images from PDF ...")
     extractor = PDFExtractor(output_dir=output_dir)
-    extraction = extractor.extract(pdf_path)
+    extraction = extractor.extract(pdf_path, source_doc=source_doc)
+    page_count = len(extraction.page_texts)
 
     # ── Step 2: Summarize images ──────────────────────────────────────────
     logger.info("\n🔍 STEP 2: Summarizing images via VLM ...")
     if extraction.images:
         summarizer = ImageSummarizer(model_name=vlm_model_name)
-        summarizer.summarize_all(extraction.images)
+        summarizer.summarize_all(extraction.images, source_doc=source_doc)
     else:
         logger.info("  No images found — skipping summarization.")
 
@@ -689,17 +746,22 @@ def run_pipeline(
     chunker = SmartChunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     chunks = chunker.chunk(reassembled_text)
 
-    # ── Step 5: Vector Store (PGVector — Persistent) ──────────────────────
+    # ── Step 5: Vector Store (PGVector — Incremental) ─────────────────────
     logger.info("\n🗄️  STEP 5: Ingesting chunks into PGVector ...")
     store_manager = VectorStoreManager(
         collection_name=collection_name,
         connection_string=connection_string,
         embedding_model=embedding_model,
     )
-    vectorstore = store_manager.ingest(chunks)
+    vectorstore = store_manager.ingest(
+        chunks,
+        source_doc=source_doc,
+        doc_hash=doc_hash,
+        page_count=page_count,
+    )
 
     logger.info("\n" + "=" * 60)
-    logger.info("PIPELINE COMPLETE ✅")
+    logger.info(f"PIPELINE COMPLETE ✅ — {source_doc}: {len(chunks)} chunks ingested")
     logger.info("=" * 60)
 
     return vectorstore, chunks

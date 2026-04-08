@@ -27,13 +27,15 @@ Complete production architecture for deploying the Charter Ingestion Pipeline on
 | Aspect | Your Prototype (Current) | Production (Target) |
 |--------|-------------------------|---------------------|
 | Users | 1 (you, `query.py` CLI) | 50-500+ concurrent via REST API |
-| VLM | NVIDIA NIM free tier (40 RPM) | Self-hosted vLLM (unlimited) |
+| VLM (Image Summarization) | NVIDIA NIM free tier (40 RPM) | Self-hosted vLLM on EC2 (on-demand, ingestion only) |
+| Answer Synthesis | NVIDIA NIM free tier | **External LLM API** (OpenAI / NIM / Azure) |
 | Embedding | NVIDIA NIM API | Self-hosted on CPU (zero cost) |
+| Reranker | Local CPU (MiniLM-L-6) | Local CPU (no KV cache needed) |
 | Search | hybrid (BM25 + semantic) | Same, behind load balancer |
 | Database | Docker container on laptop | RDS Multi-AZ (99.95% SLA) |
 | File Storage | Local `mock_s3_storage/` | Amazon S3 (11 nines durability) |
 | Availability | Your laptop uptime | 99.9%+ (multi-AZ, auto-restart) |
-| Scaling | None | Auto-scaling GPU + app instances |
+| Scaling | None | Auto-scaling app instances + on-demand GPU |
 | Security | `.env` file | Secrets Manager + VPC + IAM |
 | Monitoring | Print statements | CloudWatch + Grafana dashboards |
 | CI/CD | Manual `git push` | Automated deploy on merge |
@@ -45,22 +47,23 @@ Complete production architecture for deploying the Charter Ingestion Pipeline on
 ```
                                   INTERNET
                                      │
-                                     ▼
-                        ┌────────────────────────┐
-                        │     Amazon Route 53     │
-                        │   (DNS + Health Checks)  │
-                        │   api.yourcompany.com    │
-                        └────────────┬───────────┘
-                                     │
-                                     ▼
-                        ┌────────────────────────┐
-                        │    AWS WAF (Firewall)    │
-                        │  • Rate limiting         │
-                        │  • SQL injection block   │
-                        │  • Bot detection          │
-                        └────────────┬───────────┘
-                                     │
-                                     ▼
+                         ┌───────────┴───────────┐
+                         ▼                       ▼
+            ┌────────────────────────┐  ┌─────────────────────────┐
+            │     Amazon Route 53     │  │  External LLM API       │
+            │   (DNS + Health Checks)  │  │  (OpenAI / NIM / Azure) │
+            │   api.yourcompany.com    │  │  Answer Synthesis       │
+            └────────────┬───────────┘  │  No KV cache concern    │
+                         │              │  Provider manages all   │
+                         ▼              └─────────────────────────┘
+            ┌────────────────────────┐           ▲
+            │    AWS WAF (Firewall)    │           │ API calls from
+            │  • Rate limiting         │           │ Query Containers
+            │  • SQL injection block   │           │
+            │  • Bot detection          │           │
+            └────────────┬───────────┘           │
+                         │                       │
+                         ▼                       │
 ╔════════════════════════════════════════════════════════════════════════════════╗
 ║                            VPC (10.0.0.0/16)                                  ║
 ║                                                                                ║
@@ -85,52 +88,54 @@ Complete production architecture for deploying the Charter Ingestion Pipeline on
 ║   ┌─────────────────────────────────────────────────────────────────────────┐ ║
 ║   │                    PRIVATE SUBNETS (2 AZs)                               │ ║
 ║   │                                                                          │ ║
-║   │   ┌─────────────────────────┐   ┌──────────────────────────────────┐   │ ║
-║   │   │  QUERY SERVICE (ECS)    │   │  GPU INFERENCE TIER              │   │ ║
-║   │   │  (Auto-scaling)         │   │                                  │   │ ║
-║   │   │                         │   │  ┌────────────────────────────┐ │   │ ║
-║   │   │  ┌───────────────────┐ │   │  │  g6.2xlarge (Primary)      │ │   │ ║
-║   │   │  │ Query Container 1 │ │   │  │  1× L4 GPU (24 GB VRAM)   │ │   │ ║
-║   │   │  │ • FastAPI server  │ │   │  │                            │ │   │ ║
-║   │   │  │ • Hybrid search   │◄├───┤  │  vLLM Server (port 8000)  │ │   │ ║
-║   │   │  │ • BM25 index      │ │   │  │  nemotron-nano-vl-8b      │ │   │ ║
-║   │   │  │ • Reranker (CPU)  │ │   │  │  --gpu-mem-util 0.90      │ │   │ ║
-║   │   │  │ • Embed (CPU)     │ │   │  │  --max-model-len 4096     │ │   │ ║
-║   │   │  └───────────────────┘ │   │  │  --max-num-seqs 8         │ │   │ ║
-║   │   │  ┌───────────────────┐ │   │  └────────────────────────────┘ │   │ ║
-║   │   │  │ Query Container 2 │ │   │                                  │   │ ║
-║   │   │  │ (auto-scaled)     │ │   │  ┌────────────────────────────┐ │   │ ║
-║   │   │  └───────────────────┘ │   │  │  g6.2xlarge (Standby/      │ │   │ ║
-║   │   │  ┌───────────────────┐ │   │  │  Auto-Scale)               │ │   │ ║
-║   │   │  │ Query Container N │ │   │  │  (launches when primary    │ │   │ ║
-║   │   │  │ (auto-scaled)     │ │   │  │   GPU > 80% utilization)   │ │   │ ║
-║   │   │  └───────────────────┘ │   │  └────────────────────────────┘ │   │ ║
-║   │   └─────────────────────────┘   └──────────────────────────────────┘   │ ║
+║   │   ┌──────────────────────────────┐  ┌──────────────────────────────┐    │ ║
+║   │   │  QUERY SERVICE (ECS)         │  │  GPU TIER (INGESTION ONLY)   │    │ ║
+║   │   │  (Auto-scaling, always-on)   │  │  (On-demand — NOT 24/7)      │    │ ║
+║   │   │                              │  │                              │    │ ║
+║   │   │  ┌────────────────────────┐ │  │  ┌────────────────────────┐ │    │ ║
+║   │   │  │ Query Container 1      │ │  │  │  g6.2xlarge             │ │    │ ║
+║   │   │  │ • FastAPI server       │ │  │  │  1× L4 GPU (24 GB)     │ │    │ ║
+║   │   │  │ • Hybrid search        │ │  │  │                        │ │    │ ║
+║   │   │  │   (BM25 + semantic)    │ │  │  │  vLLM (port 8000)      │ │    │ ║
+║   │   │  │ • Embed (CPU, 1B)      │ │  │  │  nemotron-nano-vl-8b   │ │    │ ║
+║   │   │  │ • Reranker (CPU, 22M)  │ │  │  │  Image summaries only  │ │    │ ║
+║   │   │  │ • Answer → External ───┼─┼──┼──┼──► External LLM API    │ │    │ ║
+║   │   │  │   LLM API (no GPU)     │ │  │  │                        │ │    │ ║
+║   │   │  └────────────────────────┘ │  │  │  ON only during         │ │    │ ║
+║   │   │  ┌────────────────────────┐ │  │  │  ingestion (~3 hrs/wk) │ │    │ ║
+║   │   │  │ Query Container 2      │ │  │  └────────────────────────┘ │    │ ║
+║   │   │  │ (auto-scaled)          │ │  │                              │    │ ║
+║   │   │  └────────────────────────┘ │  │  No standby GPU needed —    │    │ ║
+║   │   │  ┌────────────────────────┐ │  │  queries don't use GPU!     │    │ ║
+║   │   │  │ Query Container N      │ │  │                              │    │ ║
+║   │   │  │ (auto-scaled)          │ │  │                              │    │ ║
+║   │   │  └────────────────────────┘ │  │                              │    │ ║
+║   │   └──────────────────────────────┘  └──────────────────────────────┘    │ ║
 ║   │                                                                          │ ║
-║   │   ┌─────────────────────────┐   ┌──────────────────────────────────┐   │ ║
-║   │   │  INGESTION SERVICE      │   │  DATABASE TIER                   │   │ ║
-║   │   │  (ECS — on-demand)      │   │                                  │   │ ║
-║   │   │                         │   │  ┌────────────────────────────┐ │   │ ║
-║   │   │  ┌───────────────────┐ │   │  │  RDS PostgreSQL (Primary)  │ │   │ ║
-║   │   │  │ Ingest Worker     │ │   │  │  db.r6g.xlarge             │ │   │ ║
-║   │   │  │ • PDFExtractor   │ │   │  │  • pgvector + HNSW index   │ │   │ ║
-║   │   │  │ • ImageSummarizer│─┼───┤  │  • 32 GB RAM               │ │   │ ║
-║   │   │  │ • SmartChunker   │ │   │  │  • Multi-AZ standby        │ │   │ ║
-║   │   │  │ • VectorStore    │ │   │  │  • Automated backups       │ │   │ ║
-║   │   │  └───────────────────┘ │   │  └─────────────┬──────────────┘ │   │ ║
-║   │   └─────────────────────────┘   │                │                │   │ ║
-║   │                                  │  ┌─────────────▼──────────────┐ │   │ ║
-║   │                                  │  │  RDS PostgreSQL (Standby)  │ │   │ ║
-║   │                                  │  │  (Auto-failover, AZ-2)     │ │   │ ║
-║   │                                  │  └────────────────────────────┘ │   │ ║
-║   │                                  └──────────────────────────────────┘   │ ║
+║   │   ┌──────────────────────────────┐  ┌──────────────────────────────┐    │ ║
+║   │   │  INGESTION SERVICE           │  │  DATABASE TIER               │    │ ║
+║   │   │  (ECS — on-demand)           │  │                              │    │ ║
+║   │   │                              │  │  ┌────────────────────────┐ │    │ ║
+║   │   │  ┌────────────────────────┐ │  │  │  RDS PostgreSQL (Pri)  │ │    │ ║
+║   │   │  │ Ingest Worker          │ │  │  │  db.r6g.xlarge         │ │    │ ║
+║   │   │  │ • PDFExtractor        │ │  │  │  • pgvector + HNSW     │ │    │ ║
+║   │   │  │ • ImageSummarizer ────┼─┼──┤  │  • 32 GB RAM           │ │    │ ║
+║   │   │  │   (→ vLLM on GPU)     │ │  │  │  • Multi-AZ standby    │ │    │ ║
+║   │   │  │ • SmartChunker        │ │  │  │  • Automated backups   │ │    │ ║
+║   │   │  │ • VectorStore         │ │  │  └──────────┬─────────────┘ │    │ ║
+║   │   │  └────────────────────────┘ │  │             │               │    │ ║
+║   │   └──────────────────────────────┘  │  ┌──────────▼─────────────┐ │    │ ║
+║   │                                      │  │  RDS PostgreSQL (Sby) │ │    │ ║
+║   │                                      │  │  (Auto-failover AZ-2) │ │    │ ║
+║   │                                      │  └──────────────────────┘ │    │ ║
+║   │                                      └──────────────────────────────┘    │ ║
 ║   └─────────────────────────────────────────────────────────────────────────┘ ║
 ║                                                                                ║
 ║   ┌──────────────┐  ┌──────────────┐  ┌────────────────┐  ┌───────────────┐  ║
 ║   │  Amazon S3    │  │ ElastiCache  │  │ Secrets Manager│  │  CloudWatch    │  ║
-║   │  • PDFs      │  │ Redis        │  │ • API Keys     │  │  • Metrics     │  ║
+║   │  • PDFs      │  │ Redis        │  │ • LLM API Keys │  │  • Metrics     │  ║
 ║   │  • Images    │  │ • Query cache│  │ • DB Creds     │  │  • Logs        │  ║
-║   │  • Summaries │  │ • BM25 index │  │ • vLLM tokens  │  │  • Alarms      │  ║
+║   │  • Summaries │  │              │  │ • vLLM tokens  │  │  • Alarms      │  ║
 ║   └──────────────┘  └──────────────┘  └────────────────┘  └───────────────┘  ║
 ║                                                                                ║
 ╚════════════════════════════════════════════════════════════════════════════════╝
@@ -156,7 +161,7 @@ Routing Rules:
 |--------|-------|-----|
 | HTTPS listener | Port 443 | SSL termination at ALB (ACM free certificate) |
 | Health check | `/health` every 30s | Remove unhealthy containers from rotation |
-| Idle timeout | 120 seconds | VLM responses can take 5-10s |
+| Idle timeout | 120 seconds | LLM API responses can take 5-10s |
 | Sticky sessions | Disabled | Each request is independent |
 
 ### 2. Query Service — ECS Fargate (Auto-Scaling)
@@ -170,9 +175,9 @@ app = FastAPI()
 
 @app.post("/api/query")
 async def query(request: QueryRequest):
-    # 1. Hybrid search (BM25 + semantic)
-    # 2. Cross-encoder reranking
-    # 3. LLM answer synthesis (calls vLLM on GPU instance)
+    # 1. Hybrid search (BM25 + semantic) — CPU only
+    # 2. Cross-encoder reranking — CPU only, no KV cache
+    # 3. LLM answer synthesis — External API (no GPU needed!)
     return {"answer": answer, "sources": sources}
 ```
 
@@ -182,36 +187,51 @@ async def query(request: QueryRequest):
 | Min instances | 2 | Always-on for fast response |
 | Max instances | 10 | Handles traffic spikes |
 | Auto-scale trigger | CPU > 70% for 2 min | Scales out during peak |
-| Model loaded | Reranker (88 MB) + Embed 1B (2 GB CPU) | Both run on CPU |
+| Reranker | MiniLM-L-6-v2 (22M, ~90 MB, CPU) | No KV cache needed — scores in one forward pass |
+| Embed model | nemotron-embed-1b (1B, ~2 GB, CPU) | No KV cache needed — encoder model |
+| Answer synthesis | External LLM API | No KV cache concern — provider manages all |
 
-### 3. GPU Inference Tier — EC2 g6.2xlarge
+> **Key insight:** Nothing in the query container needs KV caching or GPU.
+> Reranker and embedding model are encoder-based (single forward pass, no generation).
+> Answer synthesis is offloaded to an external API. The query service is 100% CPU.
 
-Dedicated to **VLM inference only** (nemotron-nano-vl-8b via vLLM):
+### 3. GPU Tier — EC2 g6.2xlarge (INGESTION ONLY, On-Demand)
+
+**Critical change:** The GPU is now used **only for image summarization during ingestion** — NOT for answering user queries. This means:
+- GPU can be **turned off** when not ingesting (saves ~95% GPU cost)
+- KV cache is only needed for short image summary prompts (~500 tokens)
+- Concurrency is low and controlled (batch processing, 1-4 images at a time)
 
 ```
-GPU Instance Internals:
+GPU Instance Internals (ON only during ingestion):
 ┌──────────────────────────────────────────────┐
 │  g6.2xlarge                                   │
 │  └── L4 GPU (24 GB VRAM)                     │
 │      └── vLLM Server                         │
 │          ├── Model: nemotron-nano-vl-8b (16 GB)│
 │          ├── KV Cache Pool (~6.5 GB)          │
-│          ├── Max concurrent: 6-8 requests     │
-│          ├── PagedAttention: enabled          │
-│          ├── Continuous batching: enabled     │
-│          └── Prefix caching: enabled          │
+│          ├── Image summaries: ~500 tok each   │
+│          ├── KV per request: ~0.07 GB (tiny!) │
+│          ├── Max concurrent: 4 images         │
+│          ├── Total KV needed: ~0.28 GB        │
+│          └── 6+ GB VRAM headroom              │
 │                                               │
 │  └── CPU (8 vCPUs, 32 GB RAM)                │
 │      └── System processes only               │
+│                                               │
+│  ⏰ ON: ~3 hrs/week (during PDF ingestion)    │
+│  💤 OFF: rest of the time (not needed for     │
+│     queries — synthesis via external API)     │
 └──────────────────────────────────────────────┘
 ```
 
 | Config | Value | Why |
 |--------|-------|-----|
 | Instance | g6.2xlarge | L4 GPU, 24 GB VRAM, 8 vCPU, 32 GB RAM |
-| vLLM params | `--gpu-mem-util 0.90 --max-model-len 4096` | Maximizes KV cache for concurrency |
+| vLLM params | `--gpu-mem-util 0.90 --max-model-len 2048` | Image prompts are short, 2048 is enough |
 | Placement | Private subnet | No public internet access |
-| Auto-scaling | Launch 2nd GPU when utilization > 80% | Handles ingestion bursts |
+| Scheduling | **On-demand** — start before ingestion, stop after | Pay only for ~3 hrs/week |
+| Auto-scaling | Not needed | Batch ingestion, controlled concurrency |
 
 ### 4. Ingestion Service — ECS Fargate (On-Demand)
 
@@ -264,20 +284,22 @@ HNSW Index (created once):
 
 ### 6. Redis Cache — ElastiCache
 
-Caches query results to avoid redundant GPU inference:
+Caches query results to avoid redundant LLM API calls (saves cost and latency):
 
 ```
 User asks: "What is the SLA?"
   → Check Redis: key = hash("What is the SLA?")
-    → HIT:  Return cached answer instantly (~5ms)
-    → MISS: Run full pipeline (5-8 sec), cache result, return
+    → HIT:  Return cached answer instantly (~5ms) — no API cost!
+    → MISS: Run full pipeline (3-5 sec), cache result, return
 ```
 
 | Config | Value | Why |
 |--------|-------|-----|
 | Instance | cache.r6g.large (13 GB) | Stores ~10,000 cached query results |
-| TTL | 1 hour | Balance freshness vs GPU savings |
+| TTL | 1 hour | Balance freshness vs API cost savings |
 | Eviction | LRU (Least Recently Used) | Auto-remove stale entries |
+
+> **Cost impact:** Every Redis HIT saves one LLM API call (~$0.01-0.05). With 50% hit rate on 1000 queries/day, Redis saves ~$150-750/month in API costs.
 
 ---
 
@@ -309,17 +331,19 @@ User ─────────────────────────
    └── RRF fusion                                    [~5ms]
        │
        ▼
-5. Cross-encoder reranking (CPU)                     [~300ms]
-   │
+5. Cross-encoder reranking (CPU, no KV cache)         [~300ms]
+   │    MiniLM-L-6-v2: single forward pass → score
+   │    No autoregressive generation → no KV cache
    ▼
-6. LLM answer synthesis                              [~3-5s]
-   └── HTTP call to vLLM (GPU instance, port 8000)
-       └── nemotron-nano-vl-8b generates answer
+6. LLM answer synthesis                              [~2-4s]
+   └── HTTP call to External LLM API
+       └── Provider handles KV cache, concurrency, GPU
+       └── No GPU needed on your infrastructure!
        │
        ▼
 7. Cache result in Redis, return to user             [~5ms]
 
-Total: ~4-6 seconds (dominated by LLM generation)
+Total: ~3-5 seconds (dominated by LLM API call)
 ```
 
 ### Ingestion Flow (New PDF Uploaded)
@@ -373,11 +397,14 @@ Total: ~15-25 minutes per PDF
 | Failure | Auto-Recovery | Downtime | How |
 |---------|--------------|----------|-----|
 | Query container crashes | ✅ | 0 seconds | ALB routes to healthy container, ECS replaces crashed one |
-| GPU instance dies | ⚠️ | 2-5 minutes | Auto-scaling launches replacement, vLLM loads model |
+| External LLM API down | ⚠️ | Depends on provider | Fallback: switch API provider or return cached results |
+| GPU instance dies (ingestion) | ⚠️ | 2-5 minutes | Relaunch — only affects ingestion, NOT user queries |
 | RDS primary fails | ✅ | < 60 seconds | Multi-AZ auto-failover to standby |
 | AZ-1 goes down entirely | ✅ | < 2 minutes | All services run in 2 AZs, traffic shifts to AZ-2 |
-| Redis fails | ✅ | 0 seconds | Queries bypass cache, hit GPU directly (slower but works) |
+| Redis fails | ✅ | 0 seconds | Queries bypass cache, call LLM API directly (costs more) |
 | Ingestion worker crashes | ✅ | 0 seconds | SQS re-delivers message, new worker picks it up |
+
+> **Key HA improvement:** Since queries no longer depend on your GPU, a GPU failure only affects ingestion (batch, non-urgent) — user-facing queries remain 100% available.
 
 ### Multi-AZ Design
 
@@ -385,7 +412,6 @@ Total: ~15-25 minutes per PDF
               Availability Zone 1              Availability Zone 2
           ┌─────────────────────────┐     ┌─────────────────────────┐
           │  Query Container (ECS)  │     │  Query Container (ECS)  │
-          │  GPU Instance (g6.2xl)  │     │  GPU Instance (standby) │
           │  RDS Primary            │     │  RDS Standby            │
           │  Redis Primary          │     │  Redis Replica          │
           │  NAT Gateway            │     │  NAT Gateway            │
@@ -397,7 +423,11 @@ Total: ~15-25 minutes per PDF
                     │  ALB (spans both AZs) │
                     └──────────────────────┘
 
-If AZ-1 fails → ALL traffic goes to AZ-2 automatically
+  GPU Instance: NOT in AZ diagram — only runs on-demand for ingestion
+  External LLM API: Outside AWS — provider handles HA
+
+  If AZ-1 fails → ALL query traffic goes to AZ-2 automatically
+  GPU failure → Only ingestion affected, user queries unimpacted
 ```
 
 ---
@@ -421,20 +451,20 @@ Example:
   Spike (500 req/min):           10 containers running (max)
 ```
 
-### GPU Instance Scaling
+### GPU Instance Scaling (Ingestion Only)
 
 ```
-Auto-Scaling Policy:
-  Metric: GPU utilization (via CloudWatch custom metric)
-  Scale-out: GPU > 80% for 5 minutes → Launch 2nd GPU instance
-  Scale-in:  GPU < 20% for 15 minutes → Terminate extra instance
-  Min: 1 GPU instance (always on)
-  Max: 3 GPU instances
+Scheduling Policy (not auto-scaling — ingestion is batch):
+  Trigger: SQS message received (new PDF uploaded)
+  Action:  Start g6.2xlarge → run vLLM → process PDF → stop instance
+  Min: 0 GPU instances (OFF when not ingesting)
+  Max: 1 GPU instance
 
 Cost optimization:
-  • Use Spot instances for 2nd/3rd GPU (70% cheaper, interruptible)
-  • Primary GPU = On-Demand (always available)
-  • Extra GPUs = Spot (for burst ingestion load)
+  • GPU ON only during active ingestion (~3 hrs/week)
+  • Use Spot instance (70% cheaper — ingestion is interruptible)
+  • If Spot interrupted, SQS re-delivers message, retry on new Spot
+  • Monthly GPU cost: ~$3-12 instead of $704!
 ```
 
 ---
@@ -460,8 +490,8 @@ VPC: 10.0.0.0/16
 | Component | Inbound | Outbound |
 |-----------|---------|----------|
 | ALB | 443 from 0.0.0.0/0 (HTTPS) | 8080 to Query SG |
-| Query Service | 8080 from ALB SG | 8000 to GPU SG, 5432 to RDS SG, 6379 to Redis SG |
-| GPU Instance | 8000 from Query SG + Ingestion SG | 443 to S3 (VPC endpoint) |
+| Query Service | 8080 from ALB SG | 443 to External LLM API (NAT), 5432 to RDS SG, 6379 to Redis SG |
+| GPU Instance | 8000 from Ingestion SG only | 443 to S3 (VPC endpoint) |
 | RDS | 5432 from Query SG + Ingestion SG | None |
 | Redis | 6379 from Query SG | None |
 
@@ -510,15 +540,16 @@ Developer pushes code
 
 | Metric | Source | Alert Threshold | Action |
 |--------|--------|----------------|--------|
-| GPU Utilization | NVIDIA DCGM → CloudWatch | > 80% for 5 min | Scale out GPU |
-| GPU Memory Used | NVIDIA DCGM → CloudWatch | > 90% | Reduce `--max-num-seqs` |
-| VLM Latency (P95) | vLLM metrics | > 10 seconds | Check GPU overload |
-| Query API Latency (P95) | ALB + CloudWatch | > 8 seconds | Scale out ECS |
+| **LLM API Latency (P95)** | Application logs | > 8 seconds | Check provider status, consider backup API |
+| **LLM API Error Rate** | Application logs | > 2% | Switch to backup provider |
+| **LLM API Cost** | Provider dashboard | > budget threshold | Review caching, reduce prompt size |
+| Query API Latency (P95) | ALB + CloudWatch | > 6 seconds | Scale out ECS |
 | Query API Error Rate | ALB metrics | > 1% | Page on-call |
+| Redis Hit Rate | CloudWatch | < 50% | Increase TTL or cache size (saves API cost) |
 | RDS CPU | CloudWatch | > 80% for 15 min | Scale up instance |
 | RDS Connections | CloudWatch | > 80% of max | Check connection leaks |
-| Redis Hit Rate | CloudWatch | < 50% | Increase TTL or cache size |
-| SQS Queue Depth | CloudWatch | > 10 messages | Scale ingestion workers |
+| SQS Queue Depth | CloudWatch | > 10 messages | Start GPU + scale ingestion workers |
+| GPU Utilization (ingestion) | NVIDIA DCGM | Ingestion complete | Stop GPU instance to save cost |
 | S3 Storage | CloudWatch | > 1 TB | Cost review |
 
 ---
@@ -527,13 +558,14 @@ Developer pushes code
 
 ### Monthly Cost (Production Configuration)
 
-| Component | Instance/Config | On-Demand | Reserved (1yr) |
-|-----------|----------------|-----------|----------------|
-| **GPU Inference** (g6.2xlarge, 1× L4) | 24/7 | $704 | $444 |
-| **Query Service** (ECS Fargate, 2 containers) | 4 vCPU, 8 GB each | $290 | — |
+| Component | Instance/Config | On-Demand | Notes |
+|-----------|----------------|-----------|-------|
+| **GPU (Ingestion ONLY)** (g6.2xlarge) | ~12 hrs/month (Spot) | **~$3-12** | ON only during PDF ingestion |
+| **External LLM API** | Usage-based | **~$50-300** | Depends on query volume (see below) |
+| **Query Service** (ECS Fargate, 2 containers) | 4 vCPU, 8 GB each | $290 | Always-on, no GPU needed |
 | **Ingestion Worker** (ECS Fargate, on-demand) | 4 vCPU, 16 GB, ~40 hrs/mo | $25 | — |
-| **Database** (RDS r6g.xlarge, Multi-AZ) | 4 vCPU, 32 GB, 500 GB | $748 | $472 |
-| **Redis** (ElastiCache r6g.large) | 13 GB | $195 | $123 |
+| **Database** (RDS r6g.xlarge, Multi-AZ) | 4 vCPU, 32 GB, 500 GB | $748 | $472 with Reserved |
+| **Redis** (ElastiCache r6g.large) | 13 GB | $195 | $123 with Reserved, saves API cost |
 | **S3** (Standard, ~50 GB) | Images + PDFs + cache | $2 | — |
 | **ALB** | Per-hour + LCU | $25 | — |
 | **NAT Gateway** (2×, multi-AZ) | Per-hour + data | $70 | — |
@@ -542,18 +574,170 @@ Developer pushes code
 | **Route 53** | Hosted zone + queries | $1 | — |
 | **WAF** | 3 rules | $12 | — |
 | | | | |
-| **Total (On-Demand)** | | **~$2,104/mo** | |
-| **Total (Reserved+Optimized)** | | | **~$1,474/mo** |
+| **Total** | | **~$1,453-1,703/mo** | |
+| **Total (Reserved DB + Redis)** | | **~$1,050-1,300/mo** | |
+
+### LLM API Cost Estimation
+
+| Query Volume | Avg Tokens/Query | Monthly API Cost (est.) |
+|-------------|-----------------|------------------------|
+| 100 queries/day | ~4000 tokens | ~$50/mo |
+| 500 queries/day | ~4000 tokens | ~$150/mo |
+| 1000 queries/day | ~4000 tokens | ~$300/mo |
+| With 50% Redis cache hit rate | — | **Halve the above** |
+
+> Pricing varies by provider. NVIDIA NIM Enterprise ~$1-4K/mo (unlimited). OpenAI GPT-4o-mini ~$0.15/1M input tokens.
+
+### Cost Comparison: Old vs New Architecture
+
+| | Old (GPU 24/7 for everything) | New (API synthesis + on-demand GPU) | Savings |
+|---|---|---|---|
+| GPU | $704/mo (24/7) | ~$12/mo (on-demand) | **$692** |
+| LLM API | $0 | ~$150/mo | -$150 |
+| Other infra | $1,400 | $1,400 | $0 |
+| **Total** | **~$2,104** | **~$1,562** | **~$542/mo (26%)** |
 
 ### Cost Optimization Levers
 
 | Strategy | Monthly Savings | How |
 |----------|----------------|-----|
-| Reserved Instances (GPU + DB) | ~$536 | 1-year commitment |
-| GPU off nights/weekends | ~$470 | Run 8hr/day weekdays (for ingestion-only GPU) |
-| Spot for extra GPU instances | ~$490 | Use Spot for burst ingestion |
+| Reserved Instances (DB + Redis) | ~$348 | 1-year commitment |
+| Spot for GPU ingestion | ~$8 | Spot = 70% cheaper than on-demand |
+| Redis caching (50% hit rate) | ~$75-150 | Avoid redundant LLM API calls |
 | Right-size ECS containers | ~$100 | Monitor CPU/memory, reduce if underused |
-| **Fully optimized** | | **~$950/mo** |
+| **Fully optimized** | | **~$930-1,080/mo** |
+
+### Per-Ingestion Cost (What Each PDF Costs to Process)
+
+```
+One PDF with 300 images:
+
+  GPU time:
+    300 images × ~3 sec/image = ~15 minutes of GPU time
+    g6.2xlarge: $0.978/hr → 15 min = $0.24
+    g5.2xlarge: $1.212/hr → 15 min = $0.30
+    Spot (g6):  ~$0.29/hr → 15 min = $0.07
+
+  Embedding (CPU, free — runs inside ECS container):
+    550 chunks × ~200ms = ~2 min → $0.00 (already paid for ECS)
+
+  ECS Fargate (ingestion worker):
+    4 vCPU, 16 GB × ~25 min = ~$0.04
+
+  Total per PDF:
+    On-Demand (g6): ~$0.28
+    On-Demand (g5): ~$0.34
+    Spot (g6):      ~$0.11
+
+  If you ingest 10 PDFs/month:
+    On-Demand: ~$2.80
+    Spot:      ~$1.10
+```
+
+---
+
+## L4 vs A10G — Which GPU for Your Pipeline?
+
+### Hardware Specs Comparison
+
+| Spec | NVIDIA L4 (g6) | NVIDIA A10G (g5) |
+|------|----------------|-----------------|
+| **Architecture** | Ada Lovelace (2023) | Ampere (2021) |
+| **VRAM** | 24 GB GDDR6 | 24 GB GDDR6X |
+| **Memory Bandwidth** | 300 GB/s | 600 GB/s |
+| **FP16 TFLOPS** | 121 TFLOPS | 125 TFLOPS |
+| **INT8 TOPS** | 242 TOPS | 250 TOPS |
+| **TDP (Power)** | **72W** ⚡ | 150W |
+| **Tensor Cores** | 4th Gen | 3rd Gen |
+| **FP8 Support** | ✅ Yes | ❌ No |
+| **Designed For** | Inference | Training + Inference |
+
+### Performance for Your Use Case
+
+```
+nemotron-nano-vl-8b (FP16, image summarization):
+
+  L4:   ~2.8 sec/image  (power efficient, newer arch)
+  A10G: ~2.5 sec/image  (slightly faster due to higher bandwidth)
+  Difference: ~12% faster on A10G
+
+  For 300 images:
+    L4:   ~14 min
+    A10G: ~12.5 min
+    Difference: ~1.5 minutes (negligible for batch processing)
+```
+
+### Cost Comparison (Same VRAM, Different Price)
+
+| | L4 (g6.2xlarge) | A10G (g5.2xlarge) | Difference |
+|---|---|---|---|
+| **Hourly rate** | **$0.978** | $1.212 | L4 is **19% cheaper** |
+| **3 hrs/week ingestion** | **$12/mo** | $15/mo | L4 saves $3/mo |
+| **3 hrs/week Spot** | **~$3.50/mo** | ~$4.55/mo | L4 saves $1/mo |
+| **24/7 On-Demand** | **$704/mo** | $873/mo | L4 saves **$169/mo** |
+| **Performance** | Baseline | ~12% faster | A10G slightly faster |
+| **Power consumption** | **72W** | 150W | L4 uses **52% less power** |
+| **FP8 quantization** | ✅ Supported | ❌ Not supported | L4 can run FP8 |
+
+### With FP8 Quantization (L4 Exclusive Advantage)
+
+```
+L4 supports FP8 natively → model weights shrink from 16 GB to 8 GB
+
+  FP16 (both L4 and A10G):
+    Model: 16 GB | Free VRAM: 7 GB | KV capacity: ~6 images concurrent
+
+  FP8 (L4 only):
+    Model: 8 GB  | Free VRAM: 15 GB | KV capacity: ~14 images concurrent
+    Accuracy loss: < 1% (negligible for image summaries)
+
+  This means L4 with FP8 can:
+    • Process images 2× faster (more concurrent batches)
+    • Or use --max-model-len 8192 for longer context
+```
+
+### Decision: L4 or A10G?
+
+```
+╔══════════════════════════════════════════════════════════════╗
+║                                                              ║
+║  RECOMMENDATION: L4 (g6.2xlarge)  ✅                        ║
+║                                                              ║
+║  Why:                                                        ║
+║  1. 19% cheaper ($0.978 vs $1.212/hr)                       ║
+║  2. FP8 support → halve model VRAM (L4 exclusive)           ║
+║  3. 52% less power → lower thermal throttling risk          ║
+║  4. Newer architecture (Ada Lovelace vs Ampere)             ║
+║  5. Only 12% slower than A10G (irrelevant for batch)        ║
+║                                                              ║
+║  When to choose A10G instead:                               ║
+║  • g6 instances unavailable in your AWS region              ║
+║  • You need maximum memory bandwidth (streaming tasks)       ║
+║  • Running training workloads (not your case)               ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+```
+
+### Summary: Total Monthly Cost with L4
+
+```
+Fully optimized production architecture:
+
+  GPU (L4 Spot, ~12 hrs/mo):          $    3
+  External LLM API (500 q/day):       $  150
+  ECS Query Service (2 containers):   $  290
+  ECS Ingestion Worker:               $   25
+  RDS PostgreSQL (Reserved):          $  472
+  Redis (Reserved):                   $  123
+  S3 + ALB + NAT + CloudWatch + misc: $  140
+                                      ──────
+  TOTAL:                              ~$1,203/month
+
+  vs A10G would be:                   ~$1,206/month (only $3 more)
+
+  → GPU choice barely matters at on-demand ingestion scale!
+    But L4 is still better for FP8 support and future-proofing.
+```
 
 ---
 
